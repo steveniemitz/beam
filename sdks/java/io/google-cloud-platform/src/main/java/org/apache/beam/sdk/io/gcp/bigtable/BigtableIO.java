@@ -48,6 +48,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import org.apache.beam.sdk.PipelineRunner;
 import org.apache.beam.sdk.coders.Coder;
@@ -1282,6 +1283,7 @@ public class BigtableIO {
     private final Coder<KV<ByteString, Iterable<Mutation>>> inputCoder;
     private final BadRecordRouter badRecordRouter;
 
+    private transient AtomicInteger bundleId = null;
     private transient Set<KV<BigtableWriteException, BoundedWindow>> badRecords = null;
 
     // Assign serviceEntry in startBundle and clear it in tearDown.
@@ -1303,8 +1305,15 @@ public class BigtableIO {
       LOG.debug("Created Bigtable Write Fn with writeOptions {} ", writeOptions);
     }
 
+    @Setup
+    public void setup() {
+      bundleId = new AtomicInteger();
+    }
+
     @StartBundle
     public void startBundle(StartBundleContext c) throws IOException {
+      bundleId.incrementAndGet();
+      LOG.warn("DoFn: {}. starting bundle {}", myId(), bundleId.get());
       recordsWritten = 0;
       this.seenWindows = Maps.newHashMapWithExpectedSize(1);
 
@@ -1319,8 +1328,10 @@ public class BigtableIO {
 
     @ProcessElement
     public void processElement(ProcessContext c, BoundedWindow window) throws Exception {
-      checkForFailures();
       KV<ByteString, Iterable<Mutation>> record = c.element();
+      int myBundleId = bundleId.get();
+      LOG.warn("DoFn: {}. Processing write for key {} in bundle {}", myId(), record.getKey(), myBundleId);
+      checkForFailures();
       bigtableWriter.writeRecord(record).whenComplete(handleMutationException(record, window));
       ++recordsWritten;
       seenWindows.compute(window, (key, count) -> (count != null ? count : 0) + 1);
@@ -1331,11 +1342,13 @@ public class BigtableIO {
       return (MutateRowResponse result, Throwable exception) -> {
         if (exception != null) {
           if (isDataException(exception)) {
+            LOG.warn("DoFn: {}. retrying key {}", myId(), record.getKey());
             retryIndividualRecord(record, window);
           } else {
             failures.add(new BigtableWriteException(record, exception));
           }
         }
+        LOG.warn("DoFn: {}. write for key {} finished in bundle {} with exception null = {}", myId(), record.getKey(), bundleId.get(), exception == null);
       };
     }
 
@@ -1345,9 +1358,11 @@ public class BigtableIO {
         bigtableWriter.writeSingleRecord(record);
       } catch (ApiException e) {
         if (isDataException(e)) {
+          LOG.warn("DoFn: {}. adding badrecord for key {}", myId(), record.getKey());
           // if we get another NotFoundException, we know this is the bad record.
           badRecords.add(KV.of(new BigtableWriteException(record, e), window));
         } else {
+          LOG.warn("DoFn: {}. adding failure for key {}", myId(), record.getKey());
           failures.add(new BigtableWriteException(record, e));
         }
       }
@@ -1411,6 +1426,7 @@ public class BigtableIO {
               entry.getKey());
         }
       } finally {
+        LOG.warn("DoFn: {}. Finish bundle for id {}", myId(), bundleId.get());
         if (serviceEntry != null) {
           serviceEntry.close();
           serviceEntry = null;
@@ -1448,6 +1464,10 @@ public class BigtableIO {
     private final ConcurrentLinkedQueue<BigtableWriteException> failures;
     private Map<BoundedWindow, Long> seenWindows;
 
+    private int myId() {
+      return System.identityHashCode(this);
+    }
+
     /** If any write has asynchronously failed, fail the bundle with a useful error. */
     private void checkForFailures() throws IOException {
       // Note that this function is never called by multiple threads and is the only place that
@@ -1469,7 +1489,7 @@ public class BigtableIO {
       }
       String message =
           String.format(
-              "At least %d errors occurred writing to Bigtable. First %d errors: %s",
+              "DoFn: %s. At least %d errors occurred writing to Bigtable. First %d errors: %s", myId(),
               i + failures.size(), i, logEntry.toString());
       LOG.error(message);
       IOException exception = new IOException(message);

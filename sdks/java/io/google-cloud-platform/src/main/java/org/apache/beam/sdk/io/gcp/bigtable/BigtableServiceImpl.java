@@ -514,6 +514,7 @@ class BigtableServiceImpl implements BigtableService {
           // BigtableIOWriteFn.
           // TODO: Bigtable client already tracks BatchingExceptions, use BatchingExceptions
           // instead of tracking them separately in BigtableIOWriteFn.
+          LOG.error("Ignoring BatchingException", e);
         } catch (TimeoutException e) {
           // We fail because future.get() timed out
           throw new IOException("BulkMutation took too long to close", e);

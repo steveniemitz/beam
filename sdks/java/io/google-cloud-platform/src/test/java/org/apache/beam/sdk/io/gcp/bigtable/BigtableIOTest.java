@@ -40,7 +40,10 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import com.google.api.gax.grpc.GrpcStatusCode;
 import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.NotFoundException;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.auto.value.AutoValue;
 import com.google.bigtable.v2.Cell;
 import com.google.bigtable.v2.Column;
@@ -54,24 +57,17 @@ import com.google.cloud.bigtable.config.BigtableOptions;
 import com.google.cloud.bigtable.config.BulkOptions;
 import com.google.cloud.bigtable.config.RetryOptions;
 import com.google.cloud.bigtable.data.v2.models.KeyOffset;
+import com.google.common.util.concurrent.Futures;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.SortedMap;
-import java.util.TreeMap;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
+
+import io.grpc.Status;
+import net.bytebuddy.implementation.bytecode.Throw;
 import org.apache.beam.sdk.Pipeline.PipelineExecutionException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.IterableCoder;
@@ -1932,17 +1928,30 @@ public class BigtableIOTest {
 
   /** A {@link FakeBigtableWriter} implementation that throw exceptions at given stage. */
   private static class FailureBigtableWriter extends FakeBigtableWriter {
+    private static final ScheduledExecutorService timerPool = Executors.newScheduledThreadPool(1);
+
+    private final List<CompletableFuture<?>> pendingFutures;
+
     public FailureBigtableWriter(
         String tableId, FailureBigtableService service, FailureOptions options) {
       super(tableId, service);
       this.failureOptions = options;
+      this.pendingFutures = new ArrayList<>();
     }
 
     @Override
+    @SuppressWarnings("FutureReturnValueIgnored")
     public CompletionStage<MutateRowResponse> writeRecord(KV<ByteString, Iterable<Mutation>> record)
-        throws IOException {
+            throws IOException {
       if (failureOptions.getFailAtWriteRecord()) {
-        throw new IOException("Fake IOException in writeRecord()");
+        CompletableFuture<MutateRowResponse> result = new CompletableFuture<>();
+        pendingFutures.add(result);
+        timerPool.schedule(() -> result.completeExceptionally(
+                new NotFoundException(
+                        new IOException("Fake IOException in writeRecord()"),
+                        GrpcStatusCode.of(Status.Code.NOT_FOUND),
+                        false)), 100, TimeUnit.MILLISECONDS);
+        return result;
       }
       return super.writeRecord(record);
     }
@@ -1950,11 +1959,24 @@ public class BigtableIOTest {
     @Override
     public void writeSingleRecord(KV<ByteString, Iterable<Mutation>> record) throws ApiException {
       if (failureOptions.getFailAtWriteRecord()) {
-        throw new RuntimeException("Fake RuntimeException in writeRecord()");
+        throw new ApiException(
+                new IOException("Fake IOException in writeRecord()"),
+                GrpcStatusCode.of(Status.Code.NOT_FOUND),
+                true);
       }
     }
 
     private final FailureOptions failureOptions;
+
+    @Override
+    public void close() {
+      for (CompletableFuture<?> future : pendingFutures) {
+        try {
+          future.get();
+        } catch (Throwable e) {
+        }
+      }
+    }
   }
 
   /** A serializable comparator for ByteString. Used to make row samples. */
